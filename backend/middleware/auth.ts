@@ -17,29 +17,40 @@ export async function verifyToken(req: NextApiRequest): Promise<User | null> {
     const token = authHeader.substring(7)
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret') as any
 
-    const db = getDatabase()
+    const db = await getDatabase()
     
-    // 验证会话是否存在且未过期
-    const session = db.prepare(`
-      SELECT us.*, u.id, u.username, u.email, u.avatar_url, u.is_active
-      FROM user_sessions us
-      JOIN users u ON us.user_id = u.id
-      WHERE us.session_token = ? AND us.expires_at > datetime('now') AND u.is_active = 1
-    `).get(token)
+    return new Promise((resolve, reject) => {
+      // 验证会话是否存在且未过期
+      const query = `
+        SELECT us.*, u.id, u.username, u.email, u.avatar_url, u.is_active
+        FROM user_sessions us
+        JOIN users u ON us.user_id = u.id
+        WHERE us.session_token = ? AND us.expires_at > datetime('now') AND u.is_active = 1
+      `
+      
+      db.get(query, [token], (err: any, session: any) => {
+        if (err) {
+          console.error('Database query error:', err)
+          resolve(null)
+          return
+        }
 
-    if (!session) {
-      return null
-    }
+        if (!session) {
+          resolve(null)
+          return
+        }
 
-    return {
-      id: session.id,
-      username: session.username,
-      email: session.email,
-      avatarUrl: session.avatar_url,
-      createdAt: '',
-      updatedAt: '',
-      isActive: session.is_active
-    }
+        resolve({
+          id: session.id,
+          username: session.username,
+          email: session.email,
+          avatarUrl: session.avatar_url,
+          createdAt: '',
+          updatedAt: '',
+          isActive: session.is_active
+        })
+      })
+    })
 
   } catch (error) {
     console.error('Token verification error:', error)

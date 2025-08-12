@@ -1,249 +1,276 @@
 import { NextApiRequest, NextApiResponse } from 'next'
 import { getDatabase } from '@/backend/utils/database'
-import { recordFiltersSchema, createRecordSchema } from '@/backend/utils/validation'
-import { verifyToken } from '@/backend/middleware/auth'
+import { authenticateToken } from '@/backend/middleware/auth'
+import { TradingRecord } from '@/types'
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
+    const db = await getDatabase()
+    
     if (req.method === 'GET') {
-      return await handleGetRecords(req, res)
+      return handleGetRecords(req, res, db)
     } else if (req.method === 'POST') {
-      return await handleCreateRecord(req, res)
+      return handleCreateRecord(req, res, db)
     } else {
-      return res.status(405).json({ success: false, message: '方法不允许' })
+      res.setHeader('Allow', ['GET', 'POST'])
+      return res.status(405).json({ error: 'Method not allowed' })
     }
   } catch (error) {
-    console.error('Records API error:', error)
-    res.status(500).json({
-      success: false,
-      message: '服务器内部错误'
-    })
+    console.error('Database connection error:', error)
+    return res.status(500).json({ error: 'Database connection failed' })
   }
 }
 
-async function handleGetRecords(req: NextApiRequest, res: NextApiResponse) {
+async function handleGetRecords(req: NextApiRequest, res: NextApiResponse, db: any) {
   try {
-    // 验证查询参数
-    const filters = recordFiltersSchema.parse(req.query)
-    const db = getDatabase()
+    const {
+      sortBy = 'recent',
+      coinSymbol,
+      showFavorites,
+      showMyRecords,
+      page = '1',
+      pageSize = '20'
+    } = req.query
 
-    // 构建查询条件
-    let whereClause = 'WHERE tr.is_deleted = 0 AND u.is_active = 1'
-    const params: any[] = []
+    const pageNum = parseInt(page as string)
+    const pageSizeNum = parseInt(pageSize as string)
+    const offset = (pageNum - 1) * pageSizeNum
 
-    if (filters.coin) {
-      whereClause += ' AND tr.coin_symbol LIKE ?'
-      params.push(`%${filters.coin}%`)
+    let whereConditions: string[] = []
+    let params: any[] = []
+
+    if (coinSymbol) {
+      whereConditions.push('tr.coin_symbol = ?')
+      params.push(coinSymbol)
     }
 
-    if (filters.userId) {
-      whereClause += ' AND tr.user_id = ?'
-      params.push(filters.userId)
-    }
+    // 处理用户相关的筛选
+    let userId: number | null = null
+    const authHeader = req.headers.authorization
+    if (authHeader) {
+      try {
+        const user = await authenticateToken(authHeader.replace('Bearer ', ''))
+        userId = user.id
 
-    if (filters.dateFrom) {
-      whereClause += ' AND tr.review_date >= ?'
-      params.push(filters.dateFrom)
-    }
-
-    if (filters.dateTo) {
-      whereClause += ' AND tr.review_date <= ?'
-      params.push(filters.dateTo)
-    }
-
-    if (filters.hasAiReview !== undefined) {
-      if (filters.hasAiReview) {
-        whereClause += ' AND ai.id IS NOT NULL'
-      } else {
-        whereClause += ' AND ai.id IS NULL'
+        if (showMyRecords === 'true') {
+          whereConditions.push('tr.user_id = ?')
+          params.push(userId)
+        }
+      } catch (error) {
+        // 忽略认证错误，继续显示公开记录
       }
     }
 
-    // 构建排序条件
-    let orderClause = ''
-    switch (filters.sort) {
-      case 'latest':
-        orderClause = 'ORDER BY tr.created_at DESC'
-        break
-      case 'popular':
-        orderClause = 'ORDER BY favorite_count DESC, tr.created_at DESC'
-        break
-      default:
-        orderClause = 'ORDER BY tr.created_at DESC'
-    }
-
-    // 查询总数
-    const countQuery = `
-      SELECT COUNT(*) as total
-      FROM trading_records tr
-      LEFT JOIN users u ON tr.user_id = u.id
-      LEFT JOIN ai_reviews ai ON tr.id = ai.record_id
-      ${whereClause}
-    `
-    const totalResult = db.prepare(countQuery).get(...params) as { total: number }
-    const total = totalResult.total
-
-    // 查询记录
-    const offset = (filters.page - 1) * filters.limit
-    const recordsQuery = `
+    let baseQuery = `
       SELECT 
         tr.*,
         u.username,
-        u.avatar_url as user_avatar,
+        u.avatar_url,
         COUNT(f.id) as favorite_count,
-        CASE WHEN ai.id IS NOT NULL THEN 1 ELSE 0 END as has_ai_review
+        ${userId ? `CASE WHEN uf.id IS NOT NULL THEN 1 ELSE 0 END as is_favorited` : '0 as is_favorited'}
       FROM trading_records tr
       LEFT JOIN users u ON tr.user_id = u.id
       LEFT JOIN favorites f ON tr.id = f.record_id
-      LEFT JOIN ai_reviews ai ON tr.id = ai.record_id
-      ${whereClause}
-      GROUP BY tr.id, u.username, u.avatar_url, ai.id
-      ${orderClause}
-      LIMIT ? OFFSET ?
+      ${userId ? 'LEFT JOIN favorites uf ON tr.id = uf.record_id AND uf.user_id = ?' : ''}
     `
 
-    const records = db.prepare(recordsQuery).all(...params, filters.limit, offset)
-
-    // 获取每个记录的备注
-    const recordsWithNotes = records.map(record => {
-      const notes = db.prepare(`
-        SELECT * FROM trading_notes 
-        WHERE record_id = ? 
-        ORDER BY note_order
-      `).all(record.id)
-
-      return {
-        ...record,
-        notes,
-        favoriteCount: record.favorite_count,
-        hasAiReview: Boolean(record.has_ai_review),
-        userAvatar: record.user_avatar
-      }
-    })
-
-    res.status(200).json({
-      success: true,
-      data: {
-        items: recordsWithNotes,
-        total,
-        page: filters.page,
-        limit: filters.limit,
-        totalPages: Math.ceil(total / filters.limit)
-      },
-      message: '获取成功'
-    })
-
-  } catch (error) {
-    console.error('Get records error:', error)
-    
-    if (error.name === 'ZodError') {
-      return res.status(400).json({
-        success: false,
-        message: '查询参数错误',
-        details: error.errors
-      })
+    if (userId && !showMyRecords) {
+      params.unshift(userId)
     }
 
-    throw error
+    if (showFavorites === 'true' && userId) {
+      whereConditions.push('uf.id IS NOT NULL')
+    }
+
+    if (whereConditions.length > 0) {
+      baseQuery += ' WHERE ' + whereConditions.join(' AND ')
+    }
+
+    baseQuery += ' GROUP BY tr.id'
+
+    // 排序
+    let orderBy = ''
+    switch (sortBy) {
+      case 'hot':
+        orderBy = ' ORDER BY favorite_count DESC, tr.created_at DESC'
+        break
+      case 'recent':
+      default:
+        orderBy = ' ORDER BY tr.created_at DESC'
+        break
+    }
+
+    baseQuery += orderBy
+    baseQuery += ' LIMIT ? OFFSET ?'
+    params.push(pageSizeNum, offset)
+
+    return new Promise((resolve, reject) => {
+      db.all(baseQuery, params, (err: any, rows: any[]) => {
+        if (err) {
+          console.error('Query error:', err)
+          reject(err)
+          return
+        }
+
+        // 获取总数
+        let countQuery = `
+          SELECT COUNT(DISTINCT tr.id) as total
+          FROM trading_records tr
+          LEFT JOIN users u ON tr.user_id = u.id
+          ${userId && showFavorites === 'true' ? 'LEFT JOIN favorites uf ON tr.id = uf.record_id AND uf.user_id = ?' : ''}
+        `
+
+        let countParams: any[] = []
+        if (userId && showFavorites === 'true') {
+          countParams.push(userId)
+        }
+
+        let countWhereConditions: string[] = []
+        if (coinSymbol) {
+          countWhereConditions.push('tr.coin_symbol = ?')
+          countParams.push(coinSymbol)
+        }
+        if (showMyRecords === 'true' && userId) {
+          countWhereConditions.push('tr.user_id = ?')
+          countParams.push(userId)
+        }
+        if (showFavorites === 'true' && userId) {
+          countWhereConditions.push('uf.id IS NOT NULL')
+        }
+
+        if (countWhereConditions.length > 0) {
+          countQuery += ' WHERE ' + countWhereConditions.join(' AND ')
+        }
+
+        db.get(countQuery, countParams, (countErr: any, countRow: any) => {
+          if (countErr) {
+            console.error('Count query error:', countErr)
+            reject(countErr)
+            return
+          }
+
+          const records = rows.map(row => ({
+            id: row.id,
+            userId: row.user_id,
+            username: row.username,
+            avatarUrl: row.avatar_url,
+            reviewDate: row.review_date,
+            coinSymbol: row.coin_symbol,
+            chartImage: row.chart_image,
+            profitLossRatio: row.profit_loss_ratio,
+            thinking: row.thinking,
+            favoriteCount: row.favorite_count,
+            isFavorited: Boolean(row.is_favorited),
+            createdAt: row.created_at,
+            updatedAt: row.updated_at
+          }))
+
+          res.status(200).json({
+            records,
+            pagination: {
+              page: pageNum,
+              pageSize: pageSizeNum,
+              total: countRow.total,
+              totalPages: Math.ceil(countRow.total / pageSizeNum)
+            }
+          })
+          resolve(undefined)
+        })
+      })
+    })
+  } catch (error) {
+    console.error('Get records error:', error)
+    return res.status(500).json({ error: 'Failed to fetch records' })
   }
 }
 
-async function handleCreateRecord(req: NextApiRequest, res: NextApiResponse) {
+async function handleCreateRecord(req: NextApiRequest, res: NextApiResponse, db: any) {
   try {
-    // 验证用户身份
-    const user = await verifyToken(req)
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: '请先登录'
-      })
+    const authHeader = req.headers.authorization
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Authentication required' })
     }
 
-    // 验证请求数据
-    const recordData = createRecordSchema.parse(req.body)
-    const db = getDatabase()
+    const user = await authenticateToken(authHeader.replace('Bearer ', ''))
+    const {
+      reviewDate,
+      coinSymbol,
+      chartImage,
+      profitLossRatio,
+      thinking
+    } = req.body
 
-    // 开始事务
-    const transaction = db.transaction(() => {
-      // 插入交易记录
-      const insertRecord = db.prepare(`
-        INSERT INTO trading_records (
-          user_id, review_date, coin_symbol, chart_image_url, 
-          profit_loss_ratio, thinking
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `)
+    if (!reviewDate || !coinSymbol || !thinking) {
+      return res.status(400).json({ error: 'Missing required fields' })
+    }
 
-      const result = insertRecord.run(
+    const insertQuery = `
+      INSERT INTO trading_records (
+        user_id, review_date, coin_symbol, chart_image, 
+        profit_loss_ratio, thinking, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    `
+
+    return new Promise((resolve, reject) => {
+      db.run(insertQuery, [
         user.id,
-        recordData.reviewDate,
-        recordData.coinSymbol.toUpperCase(),
-        recordData.chartImageUrl || null,
-        recordData.profitLossRatio || null,
-        recordData.thinking || null
-      )
-
-      const recordId = result.lastInsertRowid as number
-
-      // 插入备注
-      if (recordData.notes && recordData.notes.length > 0) {
-        const insertNote = db.prepare(`
-          INSERT INTO trading_notes (
-            record_id, note_order, note_type, content, image_url
-          ) VALUES (?, ?, ?, ?, ?)
-        `)
-
-        for (const note of recordData.notes) {
-          insertNote.run(
-            recordId,
-            note.noteOrder,
-            note.noteType,
-            note.content || null,
-            note.imageUrl || null
-          )
+        reviewDate,
+        coinSymbol,
+        chartImage,
+        profitLossRatio,
+        thinking
+      ], function(this: any, err: any) {
+        if (err) {
+          console.error('Insert error:', err)
+          reject(err)
+          return
         }
-      }
 
-      return recordId
+        const recordId = this.lastID
+
+        // 获取新创建的记录
+        const selectQuery = `
+          SELECT 
+            tr.*,
+            u.username,
+            u.avatar_url,
+            0 as favorite_count,
+            0 as is_favorited
+          FROM trading_records tr
+          LEFT JOIN users u ON tr.user_id = u.id
+          WHERE tr.id = ?
+        `
+
+        db.get(selectQuery, [recordId], (selectErr: any, row: any) => {
+          if (selectErr) {
+            console.error('Select error:', selectErr)
+            reject(selectErr)
+            return
+          }
+
+          const record = {
+            id: row.id,
+            userId: row.user_id,
+            username: row.username,
+            avatarUrl: row.avatar_url,
+            reviewDate: row.review_date,
+            coinSymbol: row.coin_symbol,
+            chartImage: row.chart_image,
+            profitLossRatio: row.profit_loss_ratio,
+            thinking: row.thinking,
+            favoriteCount: row.favorite_count,
+            isFavorited: Boolean(row.is_favorited),
+            createdAt: row.created_at,
+            updatedAt: row.updated_at
+          }
+
+          res.status(201).json(record)
+          resolve(undefined)
+        })
+      })
     })
-
-    const recordId = transaction()
-
-    // 获取创建的记录
-    const createdRecord = db.prepare(`
-      SELECT tr.*, u.username, u.avatar_url as user_avatar
-      FROM trading_records tr
-      LEFT JOIN users u ON tr.user_id = u.id
-      WHERE tr.id = ?
-    `).get(recordId)
-
-    const notes = db.prepare(`
-      SELECT * FROM trading_notes 
-      WHERE record_id = ? 
-      ORDER BY note_order
-    `).all(recordId)
-
-    res.status(201).json({
-      success: true,
-      data: {
-        ...createdRecord,
-        notes,
-        favoriteCount: 0,
-        hasAiReview: false
-      },
-      message: '创建成功'
-    })
-
   } catch (error) {
     console.error('Create record error:', error)
-    
-    if (error.name === 'ZodError') {
-      return res.status(400).json({
-        success: false,
-        message: '请求数据格式错误',
-        details: error.errors
-      })
-    }
-
-    throw error
+    return res.status(500).json({ error: 'Failed to create record' })
   }
 }

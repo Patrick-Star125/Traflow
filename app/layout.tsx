@@ -3,7 +3,7 @@ import { Inter } from 'next/font/google'
 import './globals.css'
 import { ThemeProvider } from '@/frontend/components/providers/ThemeProvider'
 import { AuthProvider } from '@/frontend/components/providers/AuthProvider'
-import { Toaster } from '@/frontend/components/ui/Toaster'
+import { ToastProvider } from '@/frontend/components/ui/Toaster'
 
 const inter = Inter({ subsets: ['latin'] })
 
@@ -12,7 +12,11 @@ export const metadata: Metadata = {
   description: '社区型的交易复盘记录平台，支持AI智能点评',
   keywords: ['交易', '复盘', 'AI', '社区', '加密货币'],
   authors: [{ name: 'Traflow Team' }],
-  viewport: 'width=device-width, initial-scale=1',
+}
+
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
 }
 
 export default function RootLayout({
@@ -33,7 +37,6 @@ export default function RootLayout({
             <div className="min-h-screen bg-background font-sans antialiased">
               {children}
             </div>
-            <Toaster />
           </AuthProvider>
         </ThemeProvider>
       </body>
